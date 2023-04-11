@@ -1,0 +1,106 @@
+import backtrader as bt
+import math
+import pandas as pd
+from datetime import datetime
+
+class VWZLSMAIchimokuEFC(bt.Strategy):
+    params = (
+        ("fast_length", 17),
+        ("slow_length", 20),
+        ("conversion_line_length", 9),
+        ("base_line_length", 26),
+        ("leading_span2_length", 52),
+        ("displacement_length", 19),
+        ("efc_length", 210),
+        ("efc_threshold", 0.5),
+        ("stop_loss_pct", 0.02),
+        ("spread_cost", 117)
+    )
+
+    def __init__(self):
+        self.fast_zlsma = self.zlsma(self.data.close, self.params.fast_length)
+        self.slow_zlsma = self.zlsma(self.data.close, self.params.slow_length)
+
+        self.conversion_line = (self.fast_zlsma + self.slow_zlsma) / 2
+        self.base_line = self.slow_zlsma
+        self.lead_line1 = (self.conversion_line + self.base_line) / 2
+        self.lead_line2 = self.zlsma(self.data.close, self.params.leading_span2_length)
+
+        self.norm_emsi = self.normalize(self.emsi(self.data.close, self.params.efc_length))
+        self.norm_fdi = self.normalize(self.fdi(self.data.close, self.params.efc_length))
+        self.norm_mci = self.normalize(self.mci(self.data.close, self.params.efc_length))
+
+        self.composite_score = (self.norm_emsi + self.norm_fdi + self.norm_mci) / 3
+        self.is_ranging = self.composite_score > self.params.efc_threshold
+
+    def zlsma(self, src, length):
+        lag = 2 * src - src(-length)
+        vwma_lag = bt.indicators.VWMA(lag, period=round(math.sqrt(length)))
+        return vwma_lag
+
+    def emsi(self, src, length):
+        returns = bt.indicators.LogReturn(src)
+        stdev_returns = bt.indicators.StdDev(returns, period=length)
+        entropy = -(bt.indicators.SumN(returns * bt.indicators.LogReturn(returns), period=length) / length) / stdev_returns
+        return entropy
+
+    def fdi(self, src, length):
+        high_low_diff = self.data.high - self.data.low
+        avg_price = (self.data.high + self.data.low) / 2
+        fractal_dimension = bt.indicators.SumN(high_low_diff, period=length) / bt.indicators.SumN(abs(avg_price - avg_price(-1)), period=length)
+        return fractal_dimension
+
+    def mci(self, src, length):
+        correlation_coeff = bt.indicators.Correlation(self.data.high, self.data.low, period=length)
+        mci = 1 - correlation_coeff
+        return mci
+
+    def normalize(self, val):
+        min_val = bt.indicators.Lowest(val, period=self.params.efc_length)
+        max_val = bt.indicators.Highest(val, period=self.params.efc_length)
+        return (val - min_val) / (max_val - min_val)
+
+    def next(self):
+        long_entry = bt.indicators.CrossOver(self.fast_zlsma, self.slow_zlsma) > 0 and self.data.close > self.lead_line1(-self.params.displacement_length)
+        short_entry = bt.indicators.CrossUnder(self.fast_zlsma, self.slow_zlsma) > 0 and self.data.close < self.lead_line1(-self.params.displacement_length)
+
+        if not self.is_ranging[0]:
+            if long_entry and not self.position:
+                order_size = self.broker.getvalue() / (self.data.close[0] + self.params.spread_cost)
+                self.buy(size=order_size)
+                self.stop_loss = self.sell(price=self.data.close[0] * (1 - self.params.stop_loss_pct), exectype=bt.Order.Stop, parent=self.position, size=order_size)
+
+            if short_entry and not self.position:
+                order_size = self.broker.getvalue() / (self.data.close[0] - self.params.spread_cost)
+                self.sell(size=order_size)
+                self.stop_loss = self.buy(price=self.data.close[0] * (1 + self.params.stop_loss_pct), exectype=bt.Order.Stop, parent=self.position, size=order_size)
+
+def run_backtest(data_file, initial_capital=2000):
+    cerebro = bt.Cerebro()
+    cerebro.addstrategy(VWZLSMAIchimokuEFC)
+
+    data = bt.feeds.GenericCSVData(
+        dataname=data_file,
+        dtformat="%Y-%m-%d %H:%M:%S",
+        timeframe=bt.TimeFrame.Minutes,
+        compression=1,
+        openinterest=-1,
+        nullvalue=0.0,
+        plot=False,
+        datetime=0,
+        high=2,
+        low=3,
+        open=1,
+        close=4,
+        volume=5,
+    )
+
+    cerebro.adddata(data)
+    cerebro.broker.setcash(initial_capital)
+    cerebro.addsizer(bt.sizers.PercentSizer, percents=100)
+
+    print("Starting Portfolio Value: %.2f" % cerebro.broker.getvalue())
+    cerebro.run()
+    print("Final Portfolio Value: %.2f" % cerebro.broker.getvalue())
+    cerebro.plot(style="candlestick")
+
